@@ -148,7 +148,7 @@ def fix_kubernetes_membership() -> None:
             logger.error('Failed to delete node: {e}')
 
 def set_ready_mark() -> None:
-    path = '/root/phylactery_ready'
+    path = '/k8s-helper/phylactery_ready'
     if not os.path.exists(path):
         open(path, 'w').close()
 

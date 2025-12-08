@@ -25,8 +25,8 @@ ip route add default via "$IP_ADDRESS" || true
 echo "overlay\nbr_netfilter\nip_tables" > /etc/modules-load.d/containerd.conf
 
 # Enable sysctl settings required for Kubernetes
-echo 'net.bridge.bridge-nf-call-iptables = 1' > /etc/sysctl.d/k8s.conf \
-echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.d/k8s.conf \
+echo 'net.bridge.bridge-nf-call-iptables = 1' > /etc/sysctl.d/k8s.conf 
+echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.d/k8s.conf 
 echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.d/k8s.conf
 echo 'net.ipv4.conf.all.forwarding = 1' >> /etc/sysctl.d/k8s.conf
 echo 'net.ipv4.ip_nonlocal_bind = 1' >> /etc/sysctl.d/k8s.conf
@@ -62,12 +62,14 @@ done
 
 # Load base Kubernetes images for 1.32.1 installation
 ctr -n k8s.io image import --base-name registry.k8s.io/coredns/coredns:v1.11.3 /share/images/coredns_v1.11.3.tar
-ctr -n k8s.io image import --base-name registry.k8s.io/etcd:3.5.16-0 /share/images/etcd_3.5.16-0.tar
+ctr -n k8s.io image import /share/images/etcd_3.5.24-0.tar
+ctr -n k8s.io image tag docker.io/library/etcd-fixed:latest registry.k8s.io/etcd:3.5.24-0
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-apiserver:v1.32.1 /share/images/kube-apiserver_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-controller-manager:v1.32.1 /share/images/kube-controller-manager_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-proxy:v1.32.1 /share/images/kube-proxy_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-scheduler:v1.32.1 /share/images/kube-scheduler_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.10 /share/images/pause_3.10.tar
+ctr -n k8s.io image tag registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.9 /share/images/pause_3.9.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.8 /share/images/pause_3.8.tar
 
@@ -176,8 +178,46 @@ while [ ! -f "$PHYLACTERY_READY_FILE" ]; do
 done
 
 # Initialize master node
-kubeadm init --pod-network-cidr=10.249.0.0/16 --kubernetes-version=1.32.1 --v=5 \
-  --apiserver-cert-extra-sans=10.0.0.13 --control-plane-endpoint vip.kubernetes.local:8443
+# Initialize master node with the config
+
+# Create a Kubelet configuration patch to disable disk checks for tmpfs
+# Create a Kubelet configuration patch to disable disk checks for tmpfs
+# AND include the cluster configuration settings
+cat <<EOF > /root/kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: "unix:///var/run/containerd/containerd.sock"
+  ignorePreflightErrors:
+  - FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml
+  - FileAvailable--etc-kubernetes-manifests-kube-controller-manager.yaml
+  - FileAvailable--etc-kubernetes-manifests-kube-scheduler.yaml
+  - FileAvailable--etc-kubernetes-manifests-etcd.yaml
+  - Port-10250
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+evictionHard:
+  nodefs.available: "0%"
+  nodefs.inodesFree: "0%"
+  imagefs.available: "0%"
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.32.1
+controlPlaneEndpoint: "vip.kubernetes.local:8443"
+networking:
+  podSubnet: "10.249.0.0/16"
+apiServer:
+  certSANs:
+  - "10.0.0.15"
+EOF
+
+
+
+
+# Initialize master node with the config
+kubeadm init --config /root/kubeadm-config.yaml
 
 # Setup kubectl access
 mkdir -p /root/.kube
