@@ -1,0 +1,14 @@
+[Unit]
+Description=Warewulf Secure File Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/python3 /usr/local/bin/ww-file-server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
