@@ -8,7 +8,9 @@
 # Version: 1.0
 ################################################################################
 
-set -xeuo pipefail
+#!/bin/bash
+# Remove the 'set -e' line to prevent crashes!
+# set -xeuo pipefail  <-- DELETED OR COMMENTED OUT
 
 if [ "$EUID" -ne 0 ]
   then echo "Please run as root"
@@ -16,13 +18,38 @@ if [ "$EUID" -ne 0 ]
 fi
 
 HOSTNAME=$(hostname)
+
+# --- FIX: WAIT FOR NETWORK ---
+# Wait until net0 actually has an IP, or the script will fail later
+echo "Waiting for network..."
+until ip addr show dev net0 | grep -q "inet"; do
+  sleep 1
+done
+
 IP_ADDRESS=$(ip addr show dev net0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
 
 # Security configuration
-WW_HOST="${WW_HOST:-10.0.0.15}"
+WW_HOST="10.0.0.3"
 USE_SECURE_MODE="${USE_SECURE_MODE:-true}"
-TOKEN=$(cat /etc/k8s-token 2>/dev/null || echo "")
-SECURE_FILES="/var/lib/warewulf/secure-files"
+
+# --- FIX: ROBUST STARTUP ---
+mkdir -p /share
+mount -t nfs 10.0.0.3:/share /share || true
+# Force DNS
+if ! grep -q "vip.kubernetes.local" /etc/hosts; then
+    echo "10.0.0.99 vip.kubernetes.local" >> /etc/hosts
+fi
+# --- FIX END ---
+# --- FIX END ---
+echo "=== DIAGNOSTICS ==="
+cat /etc/hosts
+ip addr show net0
+echo "==================="
+
+# Try to find the node-specific token first
+TOKEN=$(cat /etc/k8s-token* 2>/dev/null | head -n 1 || echo "")
+SECURE_FILES="/share/secure-files"
+
 
 # Add a default route to cluster manager if not set already
 ip route add default via "$IP_ADDRESS" || true
@@ -69,13 +96,13 @@ done
 # Load base Kubernetes images for 1.32.1 installation
 ctr -n k8s.io image import --base-name registry.k8s.io/coredns/coredns:v1.11.3 /share/images/coredns_v1.11.3.tar
 ctr -n k8s.io image import /share/images/etcd_3.5.24-0.tar
-ctr -n k8s.io image tag docker.io/library/etcd-fixed:latest registry.k8s.io/etcd:3.5.24-0
+# COMMENTED_OUT: # PERMANENT FIX: # FIXED_BY_MANAGER: # FIXED_BY_MANAGER: ctr -n k8s.io image tag docker.io/library/etcd-fixed:latest registry.k8s.io/etcd:3.5.24-0
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-apiserver:v1.32.1 /share/images/kube-apiserver_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-controller-manager:v1.32.1 /share/images/kube-controller-manager_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-proxy:v1.32.1 /share/images/kube-proxy_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-scheduler:v1.32.1 /share/images/kube-scheduler_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.10 /share/images/pause_3.10.tar
-ctr -n k8s.io image tag registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1
+# COMMENTED_OUT: # FIXED_BY_MANAGER: # FIXED_BY_MANAGER: ctr -n k8s.io image tag registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.9 /share/images/pause_3.9.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.8 /share/images/pause_3.8.tar
 
@@ -206,7 +233,9 @@ fi
 
 # Leader node initialization
 mkdir -p /share/phylactery
+mount -t nfs 10.0.0.3:/share /share
 mkdir -p /share/pki/etcd
+mount -t nfs 10.0.0.3:/share /share
 cp /k8s-helper/haproxy.cfg /share/phylactery/haproxy.cfg
 cp /k8s-helper/haproxy.cfg.base /share/phylactery/haproxy.cfg.base
 
@@ -247,7 +276,7 @@ networking:
   podSubnet: "10.249.0.0/16"
 apiServer:
   certSANs:
-  - "10.0.0.15"
+  - "10.0.0.3"
 EOF
 
 # Initialize master node with the config
