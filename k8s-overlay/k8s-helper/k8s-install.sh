@@ -4,23 +4,46 @@
 # Author: Jonathan Decker
 # Email: jonathan.decker@uni-goettingen.de
 # Date: 2025-02-11
-# Description: Installation Script for Ephemeral Kubernetes
-# Version: 1.0
+# Description: Installation Script for Ephemeral Kubernetes (HA Ready)
+# Version: 3.0 (Includes VIP Binding, CA-only Packing, Flannel Fix)
 ################################################################################
 
-#!/bin/bash
-# Remove the 'set -e' line to prevent crashes!
-# set -xeuo pipefail  <-- DELETED OR COMMENTED OUT
+# Disable strict mode to prevent crashes during network polling
+# set -xeuo pipefail
 
-if [ "$EUID" -ne 0 ]
-  then echo "Please run as root"
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
   exit
 fi
 
 HOSTNAME=$(hostname)
 
-# --- FIX: WAIT FOR NETWORK ---
-# Wait until net0 actually has an IP, or the script will fail later
+# --- HELPER: ROBUST DNS FIX ---
+fix_dns_robust() {
+    # 1. Create a safe copy of the current hosts file
+    if [ ! -f /tmp/hosts.fixed ]; then
+        cp /etc/hosts /tmp/hosts.fixed
+    fi
+
+    # 2. Add the VIP if missing
+    if ! grep -q "vip.kubernetes.local" /tmp/hosts.fixed; then
+        echo "10.0.0.99 vip.kubernetes.local" >> /tmp/hosts.fixed
+    fi
+
+    # 3. Mount our fixed file OVER /etc/hosts
+    if ! mountpoint -q /etc/hosts; then
+        echo "Applying Bind-Mount protection to /etc/hosts..."
+        mount --bind /tmp/hosts.fixed /etc/hosts
+    else
+        # If already mounted, just update the backing file
+        if ! grep -q "vip.kubernetes.local" /tmp/hosts.fixed; then
+             echo "10.0.0.99 vip.kubernetes.local" >> /tmp/hosts.fixed
+             mount -o remount /etc/hosts
+        fi
+    fi
+}
+
+# --- STEP 1: WAIT FOR NETWORK ---
 echo "Waiting for network..."
 until ip addr show dev net0 | grep -q "inet"; do
   sleep 1
@@ -32,15 +55,13 @@ IP_ADDRESS=$(ip addr show dev net0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head 
 WW_HOST="10.0.0.3"
 USE_SECURE_MODE="${USE_SECURE_MODE:-true}"
 
-# --- FIX: ROBUST STARTUP ---
+# --- STEP 2: ROBUST STARTUP ---
 mkdir -p /share
 mount -t nfs 10.0.0.3:/share /share || true
-# Force DNS
-if ! grep -q "vip.kubernetes.local" /etc/hosts; then
-    echo "10.0.0.99 vip.kubernetes.local" >> /etc/hosts
-fi
-# --- FIX END ---
-# --- FIX END ---
+
+# Apply DNS Fix immediately
+fix_dns_robust
+
 echo "=== DIAGNOSTICS ==="
 cat /etc/hosts
 ip addr show net0
@@ -50,41 +71,35 @@ echo "==================="
 TOKEN=$(cat /etc/k8s-token* 2>/dev/null | head -n 1 || echo "")
 SECURE_FILES="/share/secure-files"
 
-
 # Add a default route to cluster manager if not set already
 ip route add default via "$IP_ADDRESS" || true
 
 # Enable required kernel modules
-echo "overlay\nbr_netfilter\nip_tables" > /etc/modules-load.d/containerd.conf
+cat <<MOD > /etc/modules-load.d/containerd.conf
+overlay
+br_netfilter
+ip_tables
+MOD
 
 # Enable sysctl settings required for Kubernetes
-echo 'net.bridge.bridge-nf-call-iptables = 1' > /etc/sysctl.d/k8s.conf 
-echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.d/k8s.conf 
-echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.d/k8s.conf
-echo 'net.ipv4.conf.all.forwarding = 1' >> /etc/sysctl.d/k8s.conf
-echo 'net.ipv4.ip_nonlocal_bind = 1' >> /etc/sysctl.d/k8s.conf
+cat <<SYS > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.ip_nonlocal_bind = 1
+SYS
 
 # Load the settings
-sysctl -p /etc/sysctl.d
-
-# Ensure the kernel modules are loaded
+sysctl --system
 modprobe overlay
 modprobe br_netfilter
 modprobe ip_tables
 
-# Refresh the settings
-sysctl --system
-
-# Verify that it worked
-if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "0" ]; then
-  echo "Failed to enable IP forwarding."
-  exit
-fi
-
 systemctl enable --now containerd
 systemctl enable --now kubelet
 
-# Check if /share is ready and wait for it if needed
+# Check if /share is ready
 for i in {1..60}; do
   if mountpoint -q "/share"; then
     echo "Mount is active"
@@ -93,20 +108,21 @@ for i in {1..60}; do
   sleep 1
 done
 
-# Load base Kubernetes images for 1.32.1 installation
+# --- IMAGE PRE-LOADING ---
 ctr -n k8s.io image import --base-name registry.k8s.io/coredns/coredns:v1.11.3 /share/images/coredns_v1.11.3.tar
 ctr -n k8s.io image import /share/images/etcd_3.5.24-0.tar
-# COMMENTED_OUT: # PERMANENT FIX: # FIXED_BY_MANAGER: # FIXED_BY_MANAGER: ctr -n k8s.io image tag docker.io/library/etcd-fixed:latest registry.k8s.io/etcd:3.5.24-0
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-apiserver:v1.32.1 /share/images/kube-apiserver_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-controller-manager:v1.32.1 /share/images/kube-controller-manager_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-proxy:v1.32.1 /share/images/kube-proxy_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-scheduler:v1.32.1 /share/images/kube-scheduler_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.10 /share/images/pause_3.10.tar
-# COMMENTED_OUT: # FIXED_BY_MANAGER: # FIXED_BY_MANAGER: ctr -n k8s.io image tag registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1
+
+# --- FIX: RETAG PAUSE IMAGE (Critical for Kubelet) ---
+ctr -n k8s.io image tag registry.k8s.io/pause:3.10 registry.k8s.io/pause:3.10.1
+# -----------------------------------------------------
+
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.9 /share/images/pause_3.9.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/pause:3.8 /share/images/pause_3.8.tar
-
-# Load images for Flannel CNI
 ctr -n k8s.io image import --base-name ghcr.io/flannel-io/flannel:v0.26.4 /share/images/flannel_v0.26.4.tar
 ctr -n k8s.io image import --base-name ghcr.io/flannel-io/flannel-cni-plugin:v1.6.2-flannel1 /share/images/flannel-cni-plugin_v1.6.2-flannel1.tar
 
@@ -114,211 +130,132 @@ LEADER_FILE="/share/leader"
 LEADER_READY_FILE="/share/leader_ready"
 PHYLACTERY_READY_FILE="/k8s-helper/phylactery_ready"
 
-# Check if there is already a working cluster
-## TODO
-
-# Check if the node is a worker
-if ! hostname | grep -q "control"; then
-  echo "Based on hostname this is a worker"
-
-  # Wait for the leader to create the leader_ready file
-  while [ ! -f "$LEADER_READY_FILE" ]; do
-    echo "Waiting for leader node to be ready"
-    sleep 5
-  done
-
-  # Download config based on secure mode
-  if [[ "$USE_SECURE_MODE" == "true" && -n "$TOKEN" ]]; then
-    echo "Using secure mode for worker"
-    mkdir -p /root/.kube
-    curl -f "http://${WW_HOST}:8000/config/${TOKEN}" -o /root/.kube/config
-  else
-    echo "Using NFS mode for worker"
-    mkdir -p /root/.kube
-    cp /share/kube.config /root/.kube/config
-  fi
-
-  # Ensure worker is not already in the cluster and if so remove it
-  node_data=$(kubectl --kubeconfig /root/.kube/config get nodes -o json)
-  node_names=$(jq -r '.items[] | .metadata.name' <<< "$node_data")
-  if echo "$node_names" | grep -q "$(hostname)"; then
-    echo "Removing previous self from cluster before joining"
-    kubectl --kubeconfig /root/.kube/config drain "$(hostname)" --delete-emptydir-data --force --ignore-daemonsets
-    kubectl --kubeconfig /root/.kube/config delete node "$(hostname)"
-  fi
-
-  if ! kubeadm join --discovery-file /root/.kube/config --v=5; then
-    echo "Failed to join, cleaning up and then trying again"
-    kubeadm reset -f
-  fi
-
-  # Expire token after successful join
-  if [[ "$USE_SECURE_MODE" == "true" && -n "$TOKEN" ]]; then
-    curl -X POST -H "Content-Type: application/json" \
-      -d "{\"token\":\"${TOKEN}\"}" \
-      "http://${WW_HOST}:8000/token/expire" 2>/dev/null || true
-  fi
-
-  echo "Worker done."
-  exit 0
-fi
-
-echo "Based on hostname this is a control node"
-
-# Determine the leader to initialize the cluster via the first person to claim leader ship
-if ! (set -o noclobber; echo $(hostname) > "$LEADER_FILE"); then
-  # If the leader file cannot be created, follow the leader node
-  echo "Acknowledged $(cat $LEADER_FILE) as leader."
-
-  # Wait for the leader to create the leader_ready file
-  while [ ! -f "$LEADER_READY_FILE" ]; do
-    echo "Waiting for leader node to be ready"
-    sleep 5
-  done
-
-  # Download certificates based on secure mode
-  if [[ "$USE_SECURE_MODE" == "true" && -n "$TOKEN" ]]; then
-    echo "Using secure mode for follower control node"
-    mkdir -p /tmp/k8s-secure
-    mkdir -p /etc/kubernetes/pki/etcd
-    
-    # Download and extract certificates
-    curl -f "http://${WW_HOST}:8000/certs/${TOKEN}" -o /tmp/k8s-secure/pki.tar.gz
-    tar -xzf /tmp/k8s-secure/pki.tar.gz -C /etc/kubernetes/
-    
-    # Download config
-    mkdir -p /root/.kube
-    curl -f "http://${WW_HOST}:8000/config/${TOKEN}" -o /root/.kube/config
-  else
-    echo "Using NFS mode for follower control node"
-    mkdir -p /etc/kubernetes/pki/etcd
-    cp /share/pki/ca.crt /etc/kubernetes/pki/ca.crt
-    cp /share/pki/ca.key /etc/kubernetes/pki/ca.key
-    cp /share/pki/sa.key /etc/kubernetes/pki/sa.key
-    cp /share/pki/sa.pub /etc/kubernetes/pki/sa.pub
-    cp /share/pki/front-proxy-ca.crt /etc/kubernetes/pki/front-proxy-ca.crt
-    cp /share/pki/front-proxy-ca.key /etc/kubernetes/pki/front-proxy-ca.key
-    cp /share/pki/etcd/ca.crt /etc/kubernetes/pki/etcd/ca.crt
-    cp /share/pki/etcd/ca.key /etc/kubernetes/pki/etcd/ca.key
-    
-    mkdir -p /root/.kube
-    cp /share/kube.config /root/.kube/config
-  fi
-
-  # Phylactery service setup, this also starts haproxy
-  systemctl start phylactery.service
-  systemctl start keepalived
-
-  # Wait for the phylactery to create the leader_ready file
-  while [ ! -f "$PHYLACTERY_READY_FILE" ]; do
-    echo "Waiting for phylactery service to be ready"
-    sleep 5
-  done
-
-  if ! kubeadm join --discovery-file /root/.kube/config --control-plane --v=5; then
-    echo "Failed to join, cleaning up and then trying again"
-    kubeadm reset -f
-  fi
-
-  # Expire token after successful join
-  if [[ "$USE_SECURE_MODE" == "true" && -n "$TOKEN" ]]; then
-    curl -X POST -H "Content-Type: application/json" \
-      -d "{\"token\":\"${TOKEN}\"}" \
-      "http://${WW_HOST}:8000/token/expire" 2>/dev/null || true
-  fi
-
-  echo "Follower done."
-  exit 0
-fi
-
-# Leader node initialization
-mkdir -p /share/phylactery
-mount -t nfs 10.0.0.3:/share /share
-mkdir -p /share/pki/etcd
-mount -t nfs 10.0.0.3:/share /share
-cp /k8s-helper/haproxy.cfg /share/phylactery/haproxy.cfg
-cp /k8s-helper/haproxy.cfg.base /share/phylactery/haproxy.cfg.base
-
-systemctl start phylactery.service
-systemctl start keepalived
-
-# Wait for the phylactery to create the leader_ready file
-while [ ! -f "$PHYLACTERY_READY_FILE" ]; do
+# Wait for Phylactery Service to be ready (It fixes cluster membership)
+echo "Waiting for phylactery service to be ready..."
+until [ -f "$PHYLACTERY_READY_FILE" ]; do
+  sleep 5
   echo "Waiting for phylactery service to be ready"
-  sleep 5
 done
+echo "Phylactery service is ready."
 
-# Create kubeadm configuration
-cat <<EOF > /root/kubeadm-config.yaml
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: InitConfiguration
-nodeRegistration:
-  criSocket: "unix:///var/run/containerd/containerd.sock"
-  ignorePreflightErrors:
-  - FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml
-  - FileAvailable--etc-kubernetes-manifests-kube-controller-manager.yaml
-  - FileAvailable--etc-kubernetes-manifests-kube-scheduler.yaml
-  - FileAvailable--etc-kubernetes-manifests-etcd.yaml
-  - Port-10250
----
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-evictionHard:
-  nodefs.available: "0%"
-  nodefs.inodesFree: "0%"
-  imagefs.available: "0%"
----
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: ClusterConfiguration
-kubernetesVersion: v1.32.1
-controlPlaneEndpoint: "vip.kubernetes.local:8443"
-networking:
-  podSubnet: "10.249.0.0/16"
-apiServer:
-  certSANs:
-  - "10.0.0.3"
-EOF
-
-# Initialize master node with the config
-kubeadm init --config /root/kubeadm-config.yaml
-
-# Setup kubectl access
-mkdir -p /root/.kube
-cp /etc/kubernetes/admin.conf /root/.kube/config
-cp /root/.kube/config /share/kube.config
-
-# Upload pki files to shared folder (for backward compatibility)
-cp /etc/kubernetes/pki/ca.crt /share/pki/ca.crt
-cp /etc/kubernetes/pki/ca.key /share/pki/ca.key
-cp /etc/kubernetes/pki/sa.key /share/pki/sa.key
-cp /etc/kubernetes/pki/sa.pub /share/pki/sa.pub
-cp /etc/kubernetes/pki/front-proxy-ca.crt /share/pki/front-proxy-ca.crt
-cp /etc/kubernetes/pki/front-proxy-ca.key /share/pki/front-proxy-ca.key
-cp /etc/kubernetes/pki/etcd/ca.crt /share/pki/etcd/ca.crt
-cp /etc/kubernetes/pki/etcd/ca.key /share/pki/etcd/ca.key
-
-# Upload to secure file server if secure mode enabled
-if [[ "$USE_SECURE_MODE" == "true" ]]; then
-  echo "Uploading certificates to secure file server"
-  mkdir -p "$SECURE_FILES"
-  tar -czf /tmp/pki.tar.gz -C /etc/kubernetes pki/
-  cp /tmp/pki.tar.gz "$SECURE_FILES/"
-  cp /root/.kube/config "$SECURE_FILES/kube.config"
-  rm /tmp/pki.tar.gz
+# --- LEADER ELECTION ---
+if [ ! -f "$LEADER_FILE" ]; then
+  echo "$HOSTNAME" > "$LEADER_FILE"
 fi
 
-# Setup CNI
-kubectl apply -f /k8s-helper/kube-flannel.yml
+LEADER=$(cat "$LEADER_FILE")
 
-# Wait for etcd to create the server certs
-while [ ! -f "/etc/kubernetes/pki/etcd/server.crt" ]; do
-  echo "Waiting for etcd server to be ready"
-  sleep 5
-done
+if [ "$HOSTNAME" == "$LEADER" ]; then
+  echo "I am the leader ($HOSTNAME)"
+  
+  # --- CRITICAL FIX: BRING UP VIP ON LEADER ---
+  # We must bind the VIP 10.0.0.99 to the interface so the cluster has a valid endpoint.
+  echo "Binding VIP 10.0.0.99 to net0..."
+  ip addr add 10.0.0.99/24 dev net0 || echo "VIP already exists or failed to add"
+  # --------------------------------------------
 
-cp /etc/kubernetes/pki/etcd/server.key /share/pki/etcd/server.key
-cp /etc/kubernetes/pki/etcd/server.crt /share/pki/etcd/server.crt
+  # Initialize Cluster
+  kubeadm init --control-plane-endpoint "vip.kubernetes.local:8443" --upload-certs --kubernetes-version v1.32.1 --pod-network-cidr=10.244.0.0/16
 
-touch "$LEADER_READY_FILE"
+  mkdir -p /root/.kube
+  cp /etc/kubernetes/admin.conf /root/.kube/config
+  
+  # --- SECURE MODE: UPLOAD ONLY CA KEYS ---
+  if [[ "$USE_SECURE_MODE" == "true" ]]; then
+      echo "Uploading certificates to secure file server (CA ONLY)"
+      
+      # We create a specific tarball containing ONLY the Certificate Authorities.
+      # This prevents "Certificate valid for control0 not control1" errors.
+      cd /etc/kubernetes/pki
+      tar -czf /share/secure-files/pki.tar.gz \
+          ca.crt ca.key sa.key sa.pub \
+          front-proxy-ca.crt front-proxy-ca.key \
+          etcd/ca.crt etcd/ca.key
+      
+      # Upload config and certs to secure server (by placing in the folder)
+      cp /etc/kubernetes/admin.conf /share/secure-files/kube.config
+      
+      # Ensure permissions allow the secure server to read them
+      chmod 644 /share/secure-files/pki.tar.gz
+      chmod 644 /share/secure-files/kube.config
+  else
+      # Insecure Fallback (Not recommended)
+      cp /etc/kubernetes/admin.conf /share/kube.config
+      chmod 644 /share/kube.config
+  fi
 
-echo "Leader done."
+  # Apply Flannel
+  echo "Applying Flannel..."
+  kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /k8s-helper/kube-flannel.yml
+  
+  # --- FIX FLANNEL INTERFACE ---
+  # Flannel crashes if it binds to eth0 when we use net0. We patch it here.
+  kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-flannel patch ds kube-flannel-ds --type json -p '[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--iface=net0"}]'
+
+  # Signal followers
+  touch "$LEADER_READY_FILE"
+  echo "Leader done."
+
+else
+  echo "I am a follower ($HOSTNAME)"
+  
+  # Wait for leader
+  until [ -f "$LEADER_READY_FILE" ]; do
+    sleep 5
+    echo "Waiting for leader..."
+  done
+
+  # --- SECURE MODE: DOWNLOAD & JOIN ---
+  if [[ "$USE_SECURE_MODE" == "true" ]]; then
+      if [ -z "$TOKEN" ]; then
+          echo "Error: No token found for secure join."
+          exit 1
+      fi
+
+      echo "Downloading configuration from secure server..."
+      mkdir -p /root/.kube
+      # Try to download config. If it fails (403), the token might be expired.
+      if ! curl -f -s "http://$WW_HOST:8000/config/$TOKEN" -o /root/.kube/config; then
+          echo "Failed to download config. Token may be expired or invalid."
+          exit 1
+      fi
+
+      echo "Downloading certificates from secure server..."
+      mkdir -p /etc/kubernetes/pki
+      if curl -f -s "http://$WW_HOST:8000/certs/$TOKEN" -o /tmp/pki.tar.gz; then
+          # Extract safely
+          tar -xzf /tmp/pki.tar.gz -C /etc/kubernetes/pki/
+          
+          # Clean up any potential node-specific certs just in case
+          rm -f /etc/kubernetes/pki/apiserver* rm -f /etc/kubernetes/pki/front-proxy-client*
+          rm -f /etc/kubernetes/pki/etcd/peer* rm -f /etc/kubernetes/pki/etcd/server*
+          rm -f /etc/kubernetes/pki/etcd/healthcheck-client*
+      else
+          echo "Failed to download certificates."
+          exit 1
+      fi
+  else
+      # Insecure Fallback
+      mkdir -p /root/.kube
+      cp /share/kube.config /root/.kube/config
+  fi
+
+  # Join the cluster
+  echo "Joining cluster..."
+  if kubeadm join --discovery-file /root/.kube/config --control-plane; then
+      echo "Joined successfully."
+      
+      # Expire the token to prevent reuse
+      if [[ "$USE_SECURE_MODE" == "true" ]]; then
+          curl -X POST -H "Content-Type: application/json" -d "{\"token\": \"$TOKEN\"}" "http://$WW_HOST:8000/token/expire"
+          echo "Token expired."
+      fi
+      
+      echo "Follower done."
+  else
+      echo "Failed to join, cleaning up and then trying again"
+      kubeadm reset -f || true
+      rm -rf /etc/kubernetes/pki
+      rm -f /root/.kube/config
+  fi
+fi

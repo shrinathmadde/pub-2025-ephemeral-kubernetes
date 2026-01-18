@@ -3,7 +3,7 @@
 # Email: jonathan.decker@uni-goettingen.de
 # Date: 2025-02-11
 # Description: Service that helps set up and update control nodes in an HA setup
-# Version: 1.0
+# Version: 1.1 (Fixed Crash on Membership Check)
 ################################################################################
 
 import fcntl
@@ -70,15 +70,22 @@ def send_request_to_nodes(nodes: list[tuple[str, str]]) -> None:
 def discover_nodes() -> list[tuple[str, str]]:
     # Discover other nodes by reading files in the shared directory
     nodes = []
+    if not os.path.exists(SHARED_FOLDER):
+        os.makedirs(SHARED_FOLDER)
     for filename in os.listdir(SHARED_FOLDER):
         if filename.endswith('.txt'):
             filename_body = filename.replace('.txt', '')
-            hostname, ip_address = filename_body.split('_')
-            nodes.append((hostname, ip_address))
-            logger.info(f'Discovered {hostname} from {ip_address}')
+            parts = filename_body.split('_')
+            if len(parts) >= 2:
+                hostname, ip_address = parts[0], parts[1]
+                nodes.append((hostname, ip_address))
+                logger.info(f'Discovered {hostname} from {ip_address}')
     return nodes
 
 def construct_config(nodes: list[tuple[str, str]]) -> None:
+    if not os.path.exists(BASE_HAPROXY_CONFIG):
+        logger.warning(f"Base config {BASE_HAPROXY_CONFIG} not found, skipping config construction")
+        return
     with open(BASE_HAPROXY_CONFIG, 'r') as f:
         haproxy_config = f.read()
     with open(TARGET_HAPROXY_CONFIG, 'w') as f:
@@ -88,7 +95,8 @@ def construct_config(nodes: list[tuple[str, str]]) -> None:
 
 def import_config() -> None:
     try:
-        shutil.copyfile(TARGET_HAPROXY_CONFIG, INSTALL_HAPROXY_CONFIG)
+        if os.path.exists(TARGET_HAPROXY_CONFIG):
+            shutil.copyfile(TARGET_HAPROXY_CONFIG, INSTALL_HAPROXY_CONFIG)
     except Exception as e:
         logger.error(f'Failed to import config file: {e}')
 
@@ -100,6 +108,8 @@ def restart_haproxy() -> None:
         logger.error(f'Failed to restart haproxy: {e}')
 
 def fix_etcd_membership(nodes: list[tuple[str, str]]) -> None:
+    if not nodes:
+        return
     etcd_endpoints = ','.join(map(str, [node[1] + ":2379" for node in nodes]))
     logger.info(f'Using as etcd enpoints {etcd_endpoints}')
     if not os.path.exists("/share/pki/etcd/server.crt"):
@@ -129,28 +139,44 @@ def fix_kubernetes_membership() -> None:
     if not os.path.exists(path):
         logger.info("Kube config is not in share, cluster must not be ready")
         return
+    
     hostname = socket.gethostname()
+    result_json = None
+    
+    # --- BUG FIX START ---
+    # We try to get nodes. If it fails (e.g. not joined yet), we catch the error 
+    # and RETURN immediately, so we don't crash on the next line.
     try:
         result_raw = subprocess.run(['kubectl', 'get', 'nodes', '-o', 'json'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         result_json = json.loads(result_raw.stdout.decode())
     except subprocess.CalledProcessError as e:
-        logger.error(f'Failed to get nodes via kubectl: {e}')
+        logger.warning(f'Kubectl get nodes failed (Node likely not joined yet). This is normal during bootstrap: {e}')
+        return
+    except Exception as e:
+        logger.error(f'Unexpected error checking kubernetes membership: {e}')
+        return
+    # --- BUG FIX END ---
+
+    if result_json is None or 'items' not in result_json:
+        return
+
     node_names = [node['metadata']['name'] for node in result_json['items']]
     if hostname in node_names:
         try:
             logger.info("Removing self before rejoining")
             result_raw = subprocess.run(['kubectl', 'drain', hostname, '--delete-emptydir-data', '--force', '--ignore-daemonsets'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
-            logger.error('Failed to drain node: {e}')
+            logger.error(f'Failed to drain node: {e}')
         try:
             result_raw = subprocess.run(['kubectl', 'delete', 'node', hostname], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
-            logger.error('Failed to delete node: {e}')
+            logger.error(f'Failed to delete node: {e}')
 
 def set_ready_mark() -> None:
     path = '/k8s-helper/phylactery_ready'
     if not os.path.exists(path):
-        open(path, 'w').close()
+        with open(path, 'w') as f:
+            f.write("ready")
 
 def main() -> None:
     # Record node in folder

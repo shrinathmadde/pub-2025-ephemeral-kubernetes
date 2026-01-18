@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-WW_HOST_IP="${WW_HOST_IP:-10.0.0.15}"
+WW_HOST_IP="${WW_HOST_IP:-10.0.0.3}"
 SECURE_FILES="/var/lib/warewulf/secure-files"
 
 echo "Setting up secure file server..."
