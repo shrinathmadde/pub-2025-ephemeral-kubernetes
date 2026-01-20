@@ -5,7 +5,7 @@
 # Email: jonathan.decker@uni-goettingen.de
 # Date: 2025-02-11
 # Description: Installation Script for Ephemeral Kubernetes (HA Ready)
-# Version: 4.0 (Secure Upload & No-Expire Token)
+# Version: 4.1 (Secure Upload & No-Expire Token + Worker Support)
 ################################################################################
 
 # Disable strict mode to prevent crashes during network polling
@@ -131,6 +131,59 @@ LEADER_FILE="/share/leader"
 LEADER_READY_FILE="/share/leader_ready"
 PHYLACTERY_READY_FILE="/k8s-helper/phylactery_ready"
 
+# --- CHECK IF THIS IS A WORKER NODE ---
+if ! hostname | grep -q "control"; then
+  echo "Based on hostname this is a worker node"
+
+  # Wait for the leader to create the leader_ready file
+  until [ -f "$LEADER_READY_FILE" ]; do
+    echo "Waiting for leader node to be ready"
+    sleep 5
+  done
+
+  # --- SECURE MODE: DOWNLOAD CONFIG FOR WORKER ---
+  if [[ "$USE_SECURE_MODE" == "true" ]]; then
+      if [ -z "$TOKEN" ]; then
+          echo "Error: No token found for secure join."
+          exit 1
+      fi
+
+      echo "Downloading configuration from secure server..."
+      mkdir -p /root/.kube
+      # Try to download config
+      if ! curl -f -s "http://$WW_HOST:8000/config/$TOKEN" -o /root/.kube/config; then
+          echo "Failed to download config. Token may be expired or invalid."
+          exit 1
+      fi
+  else
+      # Insecure Fallback
+      mkdir -p /root/.kube
+      cp /share/kube.config /root/.kube/config
+  fi
+
+  # Ensure worker is not already in the cluster and if so remove it
+  node_data=$(kubectl --kubeconfig /root/.kube/config get nodes -o json)
+  node_names=$(jq -r '.items[] | .metadata.name' <<< "$node_data")
+  if echo "$node_names" | grep -q "$(hostname)"; then
+    echo "Removing previous self from cluster before joining"
+    kubectl --kubeconfig /root/.kube/config drain "$(hostname)" --delete-emptydir-data --force --ignore-daemonsets
+    kubectl --kubeconfig /root/.kube/config delete node "$(hostname)"
+  fi
+
+  # Join the cluster as worker
+  if kubeadm join --discovery-file /root/.kube/config --v=5; then
+      echo "Worker joined successfully."
+  else
+      echo "Failed to join, cleaning up and then trying again"
+      kubeadm reset -f || true
+  fi
+
+  echo "Worker done."
+  exit 0
+fi
+
+echo "Based on hostname this is a control node"
+
 # Wait for Phylactery Service to be ready (It fixes cluster membership)
 echo "Waiting for phylactery service to be ready..."
 until [ -f "$PHYLACTERY_READY_FILE" ]; do
@@ -205,7 +258,7 @@ if [ "$HOSTNAME" == "$LEADER" ]; then
   echo "Leader done."
 
 else
-  echo "I am a follower ($HOSTNAME)"
+  echo "I am a follower control node ($HOSTNAME)"
   
   # Wait for leader
   until [ -f "$LEADER_READY_FILE" ]; do
@@ -229,14 +282,16 @@ else
       fi
 
       echo "Downloading certificates from secure server..."
-      mkdir -p /etc/kubernetes/pki
+      mkdir -p /etc/kubernetes/pki/etcd
       if curl -f -s "http://$WW_HOST:8000/certs/$TOKEN" -o /tmp/pki.tar.gz; then
           # Extract safely
           tar -xzf /tmp/pki.tar.gz -C /etc/kubernetes/pki/
           
           # Clean up any potential node-specific certs just in case
-          rm -f /etc/kubernetes/pki/apiserver* rm -f /etc/kubernetes/pki/front-proxy-client*
-          rm -f /etc/kubernetes/pki/etcd/peer* rm -f /etc/kubernetes/pki/etcd/server*
+          rm -f /etc/kubernetes/pki/apiserver*
+          rm -f /etc/kubernetes/pki/front-proxy-client*
+          rm -f /etc/kubernetes/pki/etcd/peer*
+          rm -f /etc/kubernetes/pki/etcd/server*
           rm -f /etc/kubernetes/pki/etcd/healthcheck-client*
       else
           echo "Failed to download certificates."
@@ -246,17 +301,27 @@ else
       # Insecure Fallback
       mkdir -p /root/.kube
       cp /share/kube.config /root/.kube/config
+      
+      mkdir -p /etc/kubernetes/pki/etcd
+      cp /share/pki/ca.crt /etc/kubernetes/pki/ca.crt
+      cp /share/pki/ca.key /etc/kubernetes/pki/ca.key
+      cp /share/pki/sa.key /etc/kubernetes/pki/sa.key
+      cp /share/pki/sa.pub /etc/kubernetes/pki/sa.pub
+      cp /share/pki/front-proxy-ca.crt /etc/kubernetes/pki/front-proxy-ca.crt
+      cp /share/pki/front-proxy-ca.key /etc/kubernetes/pki/front-proxy-ca.key
+      cp /share/pki/etcd/ca.crt /etc/kubernetes/pki/etcd/ca.crt
+      cp /share/pki/etcd/ca.key /etc/kubernetes/pki/etcd/ca.key
   fi
 
-  # Join the cluster
-  echo "Joining cluster..."
-  if kubeadm join --discovery-file /root/.kube/config --control-plane; then
+  # Join the cluster as control plane
+  echo "Joining cluster as control plane..."
+  if kubeadm join --discovery-file /root/.kube/config --control-plane --v=5; then
       echo "Joined successfully."
       
       # Token Expiry has been DISABLED as requested.
       # Tokens can now be reused if the node reboots.
       
-      echo "Follower done."
+      echo "Follower control node done."
   else
       echo "Failed to join, cleaning up and then trying again"
       kubeadm reset -f || true
