@@ -7,8 +7,8 @@ OVERLAY_DIR="/var/lib/warewulf/overlays/k8s-overlay/rootfs/etc"
 mkdir -p "$TOKEN_DIR"
 mkdir -p "$OVERLAY_DIR"
 
-# Get all nodes
-NODES=$(wwctl node list | tail -n +3 | awk '{print $1}')
+# Get all nodes - FIXED to avoid duplicates and header
+NODES=$(wwctl node list | awk 'NR>2 && $1!="" {print $1}' | sort -u)
 
 for NODE in $NODES; do
     TOKEN=$(echo -n "${NODE}-$(date +%s)-$(openssl rand -hex 16)" | sha256sum | cut -d' ' -f1)
