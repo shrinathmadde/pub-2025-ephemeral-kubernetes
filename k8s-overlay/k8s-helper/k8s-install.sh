@@ -5,7 +5,7 @@
 # Email: jonathan.decker@uni-goettingen.de
 # Date: 2025-02-11
 # Description: Installation Script for Ephemeral Kubernetes (HA Ready)
-# Version: 3.0 (Includes VIP Binding, CA-only Packing, Flannel Fix)
+# Version: 4.0 (Secure Upload & No-Expire Token)
 ################################################################################
 
 # Disable strict mode to prevent crashes during network polling
@@ -68,6 +68,7 @@ ip addr show net0
 echo "==================="
 
 # Try to find the node-specific token first
+# (Used for both Followers to download AND Leader to upload)
 TOKEN=$(cat /etc/k8s-token* 2>/dev/null | head -n 1 || echo "")
 SECURE_FILES="/share/secure-files"
 
@@ -164,20 +165,27 @@ if [ "$HOSTNAME" == "$LEADER" ]; then
   if [[ "$USE_SECURE_MODE" == "true" ]]; then
       echo "Uploading certificates to secure file server (CA ONLY)"
       
-      # We create a specific tarball containing ONLY the Certificate Authorities.
-      # This prevents "Certificate valid for control0 not control1" errors.
+      # 1. Create Tarball (CA Keys Only)
       cd /etc/kubernetes/pki
-      tar -czf /share/secure-files/pki.tar.gz \
+      tar -czf /tmp/pki.tar.gz \
           ca.crt ca.key sa.key sa.pub \
           front-proxy-ca.crt front-proxy-ca.key \
           etcd/ca.crt etcd/ca.key
       
-      # Upload config and certs to secure server (by placing in the folder)
-      cp /etc/kubernetes/admin.conf /share/secure-files/kube.config
+      # 2. Upload to Secure Server via POST (No more NFS copying!)
+      echo "Uploading secrets via API Push..."
       
-      # Ensure permissions allow the secure server to read them
-      chmod 644 /share/secure-files/pki.tar.gz
-      chmod 644 /share/secure-files/kube.config
+      # Upload Config
+      curl -X POST --fail --data-binary @/etc/kubernetes/admin.conf \
+           "http://$WW_HOST:8000/upload/kube.config/$TOKEN" || echo "ERROR: Failed to upload kube.config"
+
+      # Upload PKI Keys
+      curl -X POST --fail --data-binary @/tmp/pki.tar.gz \
+           "http://$WW_HOST:8000/upload/pki.tar.gz/$TOKEN" || echo "ERROR: Failed to upload pki.tar.gz"
+
+      # Cleanup temp file
+      rm -f /tmp/pki.tar.gz
+
   else
       # Insecure Fallback (Not recommended)
       cp /etc/kubernetes/admin.conf /share/kube.config
@@ -214,7 +222,7 @@ else
 
       echo "Downloading configuration from secure server..."
       mkdir -p /root/.kube
-      # Try to download config. If it fails (403), the token might be expired.
+      # Try to download config.
       if ! curl -f -s "http://$WW_HOST:8000/config/$TOKEN" -o /root/.kube/config; then
           echo "Failed to download config. Token may be expired or invalid."
           exit 1
@@ -245,11 +253,8 @@ else
   if kubeadm join --discovery-file /root/.kube/config --control-plane; then
       echo "Joined successfully."
       
-      # Expire the token to prevent reuse
-      if [[ "$USE_SECURE_MODE" == "true" ]]; then
-          curl -X POST -H "Content-Type: application/json" -d "{\"token\": \"$TOKEN\"}" "http://$WW_HOST:8000/token/expire"
-          echo "Token expired."
-      fi
+      # Token Expiry has been DISABLED as requested.
+      # Tokens can now be reused if the node reboots.
       
       echo "Follower done."
   else
