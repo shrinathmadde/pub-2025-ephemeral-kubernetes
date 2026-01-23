@@ -5,7 +5,7 @@
 # Email: jonathan.decker@uni-goettingen.de
 # Date: 2025-02-11
 # Description: Installation Script for Ephemeral Kubernetes (HA Ready)
-# Version: 4.1 (Secure Upload & No-Expire Token + Worker Support)
+# Version: 4.2 (Script 2 Flow + Secure Upload & HPC Fixes)
 ################################################################################
 
 # Disable strict mode to prevent crashes during network polling
@@ -131,9 +131,12 @@ LEADER_FILE="/share/leader"
 LEADER_READY_FILE="/share/leader_ready"
 PHYLACTERY_READY_FILE="/k8s-helper/phylactery_ready"
 
+# Check if there is already a working cluster
+## TODO
+
 # --- CHECK IF THIS IS A WORKER NODE ---
 if ! hostname | grep -q "control"; then
-  echo "Based on hostname this is a worker node"
+  echo "Based on hostname this is a worker"
 
   # Wait for the leader to create the leader_ready file
   until [ -f "$LEADER_READY_FILE" ]; do
@@ -170,12 +173,9 @@ if ! hostname | grep -q "control"; then
     kubectl --kubeconfig /root/.kube/config delete node "$(hostname)"
   fi
 
-  # Join the cluster as worker
-  if kubeadm join --discovery-file /root/.kube/config --v=5; then
-      echo "Worker joined successfully."
-  else
-      echo "Failed to join, cleaning up and then trying again"
-      kubeadm reset -f || true
+  if ! kubeadm join --discovery-file /root/.kube/config --v=5; then
+    echo "Failed to join, cleaning up and then trying again"
+    kubeadm reset -f
   fi
 
   echo "Worker done."
@@ -184,100 +184,22 @@ fi
 
 echo "Based on hostname this is a control node"
 
-# Wait for Phylactery Service to be ready (It fixes cluster membership)
-echo "Waiting for phylactery service to be ready..."
-until [ -f "$PHYLACTERY_READY_FILE" ]; do
-  sleep 5
-  echo "Waiting for phylactery service to be ready"
-done
-echo "Phylactery service is ready."
+# --- LEADER ELECTION (Before Phylactery) ---
+# Determine the leader to initialize the cluster via the first person to claim leadership
+if ! (set -o noclobber; echo $(hostname) > "$LEADER_FILE"); then
+  # If the leader file cannot be created, follow the leader node
+  echo "Acknowledged $(cat $LEADER_FILE) as leader."
 
-# --- LEADER ELECTION ---
-if [ ! -f "$LEADER_FILE" ]; then
-  echo "$HOSTNAME" > "$LEADER_FILE"
-fi
-
-LEADER=$(cat "$LEADER_FILE")
-
-if [ "$HOSTNAME" == "$LEADER" ]; then
-  echo "I am the leader ($HOSTNAME)"
-  
-  # --- CRITICAL FIX: BRING UP VIP ON LEADER ---
-  # We must bind the VIP 10.0.0.99 to the interface so the cluster has a valid endpoint.
-  echo "Binding VIP 10.0.0.99 to net0..."
-  ip addr add 10.0.0.99/24 dev net0 || echo "VIP already exists or failed to add"
-  # --------------------------------------------
-
-  # Initialize Cluster
-  kubeadm init --control-plane-endpoint "vip.kubernetes.local:8443" --upload-certs --kubernetes-version v1.32.1 --pod-network-cidr=10.244.0.0/16
-
-  mkdir -p /root/.kube
-  cp /etc/kubernetes/admin.conf /root/.kube/config
-  
-  # --- SECURE MODE: UPLOAD ONLY CA KEYS ---
-  if [[ "$USE_SECURE_MODE" == "true" ]]; then
-      echo "Uploading certificates to secure file server (CA ONLY)"
-      
-      # 1. Create Tarball (CA Keys Only)
-      cd /etc/kubernetes/pki
-      tar -czf /tmp/pki.tar.gz \
-          ca.crt ca.key sa.key sa.pub \
-          front-proxy-ca.crt front-proxy-ca.key \
-          etcd/ca.crt etcd/ca.key
-      
-      # 2. Upload to Secure Server via POST (No more NFS copying!)
-      echo "Uploading secrets via API Push..."
-      
-      # Upload Config
-      curl -X POST --fail --data-binary @/etc/kubernetes/admin.conf \
-           "http://$WW_HOST:8000/upload/kube.config/$TOKEN" || echo "ERROR: Failed to upload kube.config"
-
-      # Upload PKI Keys
-      curl -X POST --fail --data-binary @/tmp/pki.tar.gz \
-           "http://$WW_HOST:8000/upload/pki.tar.gz/$TOKEN" || echo "ERROR: Failed to upload pki.tar.gz"
-
-      # Cleanup temp file
-      rm -f /tmp/pki.tar.gz
-
-  else
-      # Insecure Fallback (Not recommended)
-      cp /etc/kubernetes/admin.conf /share/kube.config
-      chmod 644 /share/kube.config
-  fi
-
-  # Apply Flannel
-  echo "Applying Flannel..."
-  kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /k8s-helper/kube-flannel.yml
-  
-  # --- FIX FLANNEL INTERFACE ---
-  # Flannel crashes if it binds to eth0 when we use net0. We patch it here.
-  kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-flannel patch ds kube-flannel-ds --type json -p '[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--iface=net0"}]'
-
-  # Signal followers
-  touch "$LEADER_READY_FILE"
-  echo "Leader done."
-
-else
-  echo "I am a follower control node ($HOSTNAME)"
-  
-  # Wait for leader
+  # Wait for the leader to create the leader_ready file
   until [ -f "$LEADER_READY_FILE" ]; do
+    echo "Waiting for leader node to be ready"
     sleep 5
-    echo "Waiting for leader..."
   done
 
-  # --- SECURE MODE: DOWNLOAD & JOIN ---
+  # --- SECURE MODE: DOWNLOAD CERTS FOR FOLLOWER ---
   if [[ "$USE_SECURE_MODE" == "true" ]]; then
       if [ -z "$TOKEN" ]; then
           echo "Error: No token found for secure join."
-          exit 1
-      fi
-
-      echo "Downloading configuration from secure server..."
-      mkdir -p /root/.kube
-      # Try to download config.
-      if ! curl -f -s "http://$WW_HOST:8000/config/$TOKEN" -o /root/.kube/config; then
-          echo "Failed to download config. Token may be expired or invalid."
           exit 1
       fi
 
@@ -298,10 +220,7 @@ else
           exit 1
       fi
   else
-      # Insecure Fallback
-      mkdir -p /root/.kube
-      cp /share/kube.config /root/.kube/config
-      
+      # Insecure Fallback - Copy from /share
       mkdir -p /etc/kubernetes/pki/etcd
       cp /share/pki/ca.crt /etc/kubernetes/pki/ca.crt
       cp /share/pki/ca.key /etc/kubernetes/pki/ca.key
@@ -313,19 +232,127 @@ else
       cp /share/pki/etcd/ca.key /etc/kubernetes/pki/etcd/ca.key
   fi
 
-  # Join the cluster as control plane
-  echo "Joining cluster as control plane..."
-  if kubeadm join --discovery-file /root/.kube/config --control-plane --v=5; then
-      echo "Joined successfully."
-      
-      # Token Expiry has been DISABLED as requested.
-      # Tokens can now be reused if the node reboots.
-      
-      echo "Follower control node done."
+  # Phylactery service setup, this also starts haproxy
+  systemctl start phylactery.service
+
+  systemctl start keepalived
+
+  # --- SECURE MODE: DOWNLOAD CONFIG FOR FOLLOWER ---
+  if [[ "$USE_SECURE_MODE" == "true" ]]; then
+      echo "Downloading configuration from secure server..."
+      mkdir -p /root/.kube
+      if ! curl -f -s "http://$WW_HOST:8000/config/$TOKEN" -o /root/.kube/config; then
+          echo "Failed to download config. Token may be expired or invalid."
+          exit 1
+      fi
   else
-      echo "Failed to join, cleaning up and then trying again"
-      kubeadm reset -f || true
-      rm -rf /etc/kubernetes/pki
-      rm -f /root/.kube/config
+      # Setup kubectl access
+      mkdir -p /root/.kube
+      cp /share/kube.config /root/.kube/config
   fi
+
+  # Wait for the phylactery to create the phylactery_ready file
+  until [ -f "$PHYLACTERY_READY_FILE" ]; do
+    echo "Waiting for phylactery service to be ready"
+    sleep 5
+  done
+
+  if ! kubeadm join --discovery-file /root/.kube/config --control-plane --v=5; then
+    echo "Failed to join, cleaning up and then trying again"
+    kubeadm reset -f
+  fi
+
+  echo "Follower done."
+  exit 0
 fi
+
+# --- LEADER INITIALIZATION ---
+echo "I am the leader ($HOSTNAME)"
+
+# Setup phylactery directories
+mkdir -p /share/phylactery
+mkdir -p /share/pki/etcd
+cp /k8s-helper/haproxy.cfg /share/phylactery/haproxy.cfg
+cp /k8s-helper/haproxy.cfg.base /share/phylactery/haproxy.cfg.base
+
+systemctl start phylactery.service
+
+#systemctl start haproxy
+systemctl start keepalived
+
+# Wait for the phylactery to create the phylactery_ready file
+until [ -f "$PHYLACTERY_READY_FILE" ]; do
+  echo "Waiting for phylactery service to be ready"
+  sleep 5
+done
+
+# Initialize master node
+kubeadm init --pod-network-cidr=10.244.0.0/16 --kubernetes-version=v1.32.1 --v=5 \
+  --control-plane-endpoint vip.kubernetes.local:8443 --upload-certs
+
+# Setup kubectl access
+mkdir -p /root/.kube
+cp /etc/kubernetes/admin.conf /root/.kube/config
+
+# --- SECURE MODE: UPLOAD KEYS AND CONFIG ---
+if [[ "$USE_SECURE_MODE" == "true" ]]; then
+    echo "Uploading certificates to secure file server (CA ONLY)"
+    
+    # 1. Create Tarball (CA Keys Only)
+    cd /etc/kubernetes/pki
+    tar -czf /tmp/pki.tar.gz \
+        ca.crt ca.key sa.key sa.pub \
+        front-proxy-ca.crt front-proxy-ca.key \
+        etcd/ca.crt etcd/ca.key
+    
+    # 2. Upload to Secure Server via POST (No more NFS copying!)
+    echo "Uploading secrets via API Push..."
+    
+    # Upload Config
+    curl -X POST --fail --data-binary @/etc/kubernetes/admin.conf \
+         "http://$WW_HOST:8000/upload/kube.config/$TOKEN" || echo "ERROR: Failed to upload kube.config"
+
+    # Upload PKI Keys
+    curl -X POST --fail --data-binary @/tmp/pki.tar.gz \
+         "http://$WW_HOST:8000/upload/pki.tar.gz/$TOKEN" || echo "ERROR: Failed to upload pki.tar.gz"
+
+    # Cleanup temp file
+    rm -f /tmp/pki.tar.gz
+
+else
+    # Insecure Fallback (Not recommended) - Upload to /share
+    cp /root/.kube/config /share/kube.config
+
+    # Upload pki files to shared folder
+    cp /etc/kubernetes/pki/ca.crt /share/pki/ca.crt
+    cp /etc/kubernetes/pki/ca.key /share/pki/ca.key
+    cp /etc/kubernetes/pki/sa.key /share/pki/sa.key
+    cp /etc/kubernetes/pki/sa.pub /share/pki/sa.pub
+    cp /etc/kubernetes/pki/front-proxy-ca.crt /share/pki/front-proxy-ca.crt
+    cp /etc/kubernetes/pki/front-proxy-ca.key /share/pki/front-proxy-ca.key
+    cp /etc/kubernetes/pki/etcd/ca.crt /share/pki/etcd/ca.crt
+    cp /etc/kubernetes/pki/etcd/ca.key /share/pki/etcd/ca.key
+fi
+
+# Setup CNI
+kubectl apply -f /k8s-helper/kube-flannel.yml
+
+# --- FIX FLANNEL INTERFACE ---
+# Flannel crashes if it binds to eth0 when we use net0. We patch it here.
+kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-flannel patch ds kube-flannel-ds --type json -p '[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--iface=net0"}]'
+
+# Wait for etcd to create the server certs (Script 2 compatibility)
+until [ -f "/etc/kubernetes/pki/etcd/server.crt" ]; do
+  echo "Waiting for etcd server to be ready"
+  sleep 5
+done
+
+# Upload etcd server certs if needed (Script 2 compatibility)
+if [[ "$USE_SECURE_MODE" != "true" ]]; then
+    cp /etc/kubernetes/pki/etcd/server.key /share/pki/etcd/server.key
+    cp /etc/kubernetes/pki/etcd/server.crt /share/pki/etcd/server.crt
+fi
+
+touch "$LEADER_READY_FILE"
+
+echo "Leader done."
