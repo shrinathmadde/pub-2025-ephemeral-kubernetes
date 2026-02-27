@@ -52,12 +52,12 @@ done
 IP_ADDRESS=$(ip addr show dev net0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
 
 # Security configuration
-WW_HOST="10.0.0.3"
+WW_HOST="10.0.0.7"
 USE_SECURE_MODE="${USE_SECURE_MODE:-true}"
 
 # --- STEP 2: ROBUST STARTUP ---
 mkdir -p /share
-mount -t nfs 10.0.0.3:/share /share || true
+mount -t nfs 10.0.0.7:/share /share || true
 
 # Apply DNS Fix immediately
 fix_dns_robust
@@ -69,7 +69,7 @@ echo "==================="
 
 # Try to find the node-specific token first
 # (Used for both Followers to download AND Leader to upload)
-TOKEN=$(cat /etc/k8s-token* 2>/dev/null | head -n 1 || echo "")
+TOKEN=$(cat /etc/k8s-token.${HOSTNAME} 2>/dev/null || echo "")
 SECURE_FILES="/share/secure-files"
 
 # Add a default route to cluster manager if not set already
@@ -112,6 +112,8 @@ done
 # --- IMAGE PRE-LOADING ---
 ctr -n k8s.io image import --base-name registry.k8s.io/coredns/coredns:v1.11.3 /share/images/coredns_v1.11.3.tar
 ctr -n k8s.io image import /share/images/etcd_3.5.24-0.tar
+ETCD_IMG=$(ctr -n k8s.io images ls | grep etcd | head -n 1 | awk '{print $1}')
+ctr -n k8s.io image tag $ETCD_IMG registry.k8s.io/etcd:3.5.24-0
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-apiserver:v1.32.1 /share/images/kube-apiserver_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-controller-manager:v1.32.1 /share/images/kube-controller-manager_v1.32.1.tar
 ctr -n k8s.io image import --base-name registry.k8s.io/kube-proxy:v1.32.1 /share/images/kube-proxy_v1.32.1.tar
