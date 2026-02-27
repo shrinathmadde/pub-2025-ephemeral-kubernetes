@@ -7,8 +7,14 @@ OVERLAY_DIR="/var/lib/warewulf/overlays/k8s-overlay/rootfs/etc"
 mkdir -p "$TOKEN_DIR"
 mkdir -p "$OVERLAY_DIR"
 
-# Get all nodes - FIXED to avoid duplicates and header
-NODES=$(wwctl node list | awk 'NR>2 && $1!="" {print $1}' | sort -u)
+# Safely get all nodes by ignoring headers, separators (===), and empty lines
+NODES=$(wwctl node list | grep -E '^[a-zA-Z0-9]' | grep -v "^NODE" | awk '{print $1}' | sort -u)
+
+# Safety fallback just in case wwctl output is empty or formatting changes
+if [ -z "$NODES" ]; then
+    echo "Warning: Could not detect nodes automatically. Using fallback list."
+    NODES="control0 control1"
+fi
 
 for NODE in $NODES; do
     TOKEN=$(echo -n "${NODE}-$(date +%s)-$(openssl rand -hex 16)" | sha256sum | cut -d' ' -f1)

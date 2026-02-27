@@ -27,19 +27,14 @@ def validate_token(token):
     with open(token_file) as f:
         data = json.load(f)
     
+    # We kept the manual expiration check just in case you ever want to 
+    # purposefully revoke a token in the future using the /token/expire endpoint.
     if data.get('expired', False):
         return False, "Token expired"
     
-    # Check for timeout (10 mins after first use)
-    if data.get('first_use'):
-        elapsed = time.time() - data['first_use']
-        if elapsed > 600: 
-            return False, "Token timed out"
-    else:
-        # Mark first use time
-        data['first_use'] = time.time()
-        with open(token_file, 'w') as f:
-            json.dump(data, f)
+    # --- TIME-BASED EXPIRATION REMOVED ---
+    # The 10-minute timeout limit has been removed. 
+    # Tokens are now persistently valid.
     
     return True, data.get('node', 'unknown')
 
@@ -116,4 +111,4 @@ def expire_token():
 
 if __name__ == '__main__':
     # Listen on internal IP (Manager)
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=8000)   
