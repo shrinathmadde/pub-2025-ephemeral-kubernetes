@@ -234,12 +234,8 @@ if ! (set -o noclobber; echo $(hostname) > "$LEADER_FILE"); then
       cp /share/pki/etcd/ca.key /etc/kubernetes/pki/etcd/ca.key
   fi
 
-  # Phylactery service setup, this also starts haproxy
-  systemctl start phylactery.service
-
-  systemctl start keepalived
-
   # --- SECURE MODE: DOWNLOAD CONFIG FOR FOLLOWER ---
+  # Must happen before phylactery starts so fix_kubernetes_membership() can find /root/.kube/config
   if [[ "$USE_SECURE_MODE" == "true" ]]; then
       echo "Downloading configuration from secure server..."
       mkdir -p /root/.kube
@@ -252,6 +248,11 @@ if ! (set -o noclobber; echo $(hostname) > "$LEADER_FILE"); then
       mkdir -p /root/.kube
       cp /share/kube.config /root/.kube/config
   fi
+
+  # Phylactery service setup, this also starts haproxy
+  systemctl start phylactery.service
+
+  systemctl start keepalived
 
   # Wait for the phylactery to create the phylactery_ready file
   until [ -f "$PHYLACTERY_READY_FILE" ]; do

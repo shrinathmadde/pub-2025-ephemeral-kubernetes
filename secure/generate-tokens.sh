@@ -24,8 +24,7 @@ for NODE in $NODES; do
 {
   "node": "$NODE",
   "token": "$TOKEN",
-  "created": $(date +%s),
-  "expired": false
+  "created": $(date +%s)
 }
 EOF
     

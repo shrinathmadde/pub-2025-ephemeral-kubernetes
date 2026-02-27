@@ -112,11 +112,11 @@ def fix_etcd_membership(nodes: list[tuple[str, str]]) -> None:
         return
     etcd_endpoints = ','.join(map(str, [node[1] + ":2379" for node in nodes]))
     logger.info(f'Using as etcd enpoints {etcd_endpoints}')
-    if not os.path.exists("/share/pki/etcd/server.crt"):
+    if not os.path.exists("/etc/kubernetes/pki/etcd/server.crt"):
         logger.info("No cluster up yet, skipping etcd check")
         return
     try:
-        result_raw = subprocess.run(['etcdctl', '--endpoints', etcd_endpoints, '--cert=/share/pki/etcd/server.crt', '--key=/share/pki/etcd/server.key', '--cacert=/share/pki/etcd/ca.crt', '-w', 'json', 'member', 'list'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result_raw = subprocess.run(['etcdctl', '--endpoints', etcd_endpoints, '--cert=/etc/kubernetes/pki/etcd/server.crt', '--key=/etc/kubernetes/pki/etcd/server.key', '--cacert=/etc/kubernetes/pki/etcd/ca.crt', '-w', 'json', 'member', 'list'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         result_json = json.loads(result_raw.stdout.decode())
         logger.info(result_json)
     except subprocess.CalledProcessError as e:
@@ -128,16 +128,16 @@ def fix_etcd_membership(nodes: list[tuple[str, str]]) -> None:
     if len(ids)>0:
         try:
             logger.info(f"Removing member {ids[0]}")
-            result_raw = subprocess.run(['etcdctl', '--endpoints', etcd_endpoints, '--cert=/share/pki/etcd/server.crt', '--key=/share/pki/etcd/server.key', '--cacert=/share/pki/etcd/ca.crt', '-w', 'json', 'member', 'remove', hex(ids[0])[2:]], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result_raw = subprocess.run(['etcdctl', '--endpoints', etcd_endpoints, '--cert=/etc/kubernetes/pki/etcd/server.crt', '--key=/etc/kubernetes/pki/etcd/server.key', '--cacert=/etc/kubernetes/pki/etcd/ca.crt', '-w', 'json', 'member', 'remove', hex(ids[0])[2:]], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             result_json = json.loads(result_raw.stdout.decode())
             logger.info(result_json)
         except subprocess.CalledProcessError as e:
             logger.error(f'Failed to remove etcd member: {e}')
 
 def fix_kubernetes_membership() -> None:
-    path = '/share/kube.config'
+    path = '/root/.kube/config'
     if not os.path.exists(path):
-        logger.info("Kube config is not in share, cluster must not be ready")
+        logger.info("Kube config not found at /root/.kube/config, cluster must not be ready")
         return
     
     hostname = socket.gethostname()

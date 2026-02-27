@@ -23,19 +23,10 @@ def validate_token(token):
     token_file = Path(TOKEN_DIR) / f"{token}.json"
     if not token_file.exists():
         return False, "Token not found"
-    
+
     with open(token_file) as f:
         data = json.load(f)
-    
-    # We kept the manual expiration check just in case you ever want to 
-    # purposefully revoke a token in the future using the /token/expire endpoint.
-    if data.get('expired', False):
-        return False, "Token expired"
-    
-    # --- TIME-BASED EXPIRATION REMOVED ---
-    # The 10-minute timeout limit has been removed. 
-    # Tokens are now persistently valid.
-    
+
     return True, data.get('node', 'unknown')
 
 # --- NEW ENDPOINT: UPLOAD ---
@@ -94,20 +85,6 @@ def get_config(token):
     log(f"DOWNLOAD CONFIG: {node}")
     return send_file(f"{FILES_DIR}/kube.config")
 
-@app.route('/token/expire', methods=['POST'])
-def expire_token():
-    token = request.json.get('token')
-    token_file = Path(TOKEN_DIR) / f"{token}.json"
-    
-    if token_file.exists():
-        with open(token_file) as f:
-            data = json.load(f)
-        data['expired'] = True
-        with open(token_file, 'w') as f:
-            json.dump(data, f)
-        log(f"TOKEN EXPIRED: {data.get('node', 'unknown')}")
-    
-    return {'status': 'ok'}
 
 if __name__ == '__main__':
     # Listen on internal IP (Manager)
