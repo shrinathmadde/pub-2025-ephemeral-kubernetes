@@ -3,7 +3,14 @@
 # Email: jonathan.decker@uni-goettingen.de
 # Date: 2025-02-11
 # Description: Service that helps set up and update control nodes in an HA setup
-# Version: 1.1 (Fixed Crash on Membership Check)
+# Version: 2.0 (Multi-Approach Security Support)
+#
+# Reads SECURITY_MODE from /k8s-helper/security_mode (written by k8s-install.sh)
+# and selects the appropriate kubeconfig for node membership cleanup:
+#
+#   APPROACH_1 = NFS-SIMPLE    → /root/.kube/config  (full admin, from /share)
+#   APPROACH_2 = SECURE-SERVER → /root/.kube/config  (full admin, from server)
+#   APPROACH_3 = TOKEN-RBAC    → /share/phylactery-kubeconfig  (SA, node ops only)
 ################################################################################
 
 import fcntl
@@ -28,6 +35,35 @@ BASE_HAPROXY_CONFIG = f"{SHARED_FOLDER}/haproxy.cfg.base"
 TARGET_HAPROXY_CONFIG = f"{SHARED_FOLDER}/haproxy.cfg"
 INSTALL_HAPROXY_CONFIG = "/etc/haproxy/haproxy.cfg"
 INTERFACE = "net0"
+
+# ---------------------------------------------------------------------------
+# SECURITY MODE
+# ---------------------------------------------------------------------------
+def _read_security_mode() -> str:
+    try:
+        with open('/k8s-helper/security_mode', 'r') as f:
+            return f.read().strip()
+    except OSError:
+        return os.environ.get('SECURITY_MODE', 'APPROACH_3')
+
+SECURITY_MODE = _read_security_mode()
+logger.info(f"Security mode: {SECURITY_MODE}")
+
+
+def get_kubeconfig_path() -> str | None:
+    """Return the kubeconfig path appropriate for the active security mode."""
+    if SECURITY_MODE == 'APPROACH_3':
+        # Use the scoped SA kubeconfig written to /share by the leader.
+        # Falls back to admin config if the SA config is not yet available.
+        if os.path.exists('/share/phylactery-kubeconfig'):
+            return '/share/phylactery-kubeconfig'
+
+    # APPROACH_1 and APPROACH_2 (and APPROACH_3 fallback): admin config.
+    if os.path.exists('/root/.kube/config'):
+        return '/root/.kube/config'
+
+    return None
+
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
@@ -108,10 +144,11 @@ def restart_haproxy() -> None:
         logger.error(f'Failed to restart haproxy: {e}')
 
 def fix_etcd_membership(nodes: list[tuple[str, str]]) -> None:
+    # etcdctl uses the local node certs directly — same for all security modes
     if not nodes:
         return
     etcd_endpoints = ','.join(map(str, [node[1] + ":2379" for node in nodes]))
-    logger.info(f'Using as etcd enpoints {etcd_endpoints}')
+    logger.info(f'Using as etcd endpoints {etcd_endpoints}')
     if not os.path.exists("/etc/kubernetes/pki/etcd/server.crt"):
         logger.info("No cluster up yet, skipping etcd check")
         return
@@ -125,7 +162,7 @@ def fix_etcd_membership(nodes: list[tuple[str, str]]) -> None:
     id_client_url_tuples = [(member['ID'], member['clientURLs'][0]) for member in result_json['members']]
     ip_address = get_ip_address(INTERFACE)
     ids = [id for id, url in id_client_url_tuples if ip_address in url]
-    if len(ids)>0:
+    if len(ids) > 0:
         try:
             logger.info(f"Removing member {ids[0]}")
             result_raw = subprocess.run(['etcdctl', '--endpoints', etcd_endpoints, '--cert=/etc/kubernetes/pki/etcd/server.crt', '--key=/etc/kubernetes/pki/etcd/server.key', '--cacert=/etc/kubernetes/pki/etcd/ca.crt', '-w', 'json', 'member', 'remove', hex(ids[0])[2:]], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -135,27 +172,33 @@ def fix_etcd_membership(nodes: list[tuple[str, str]]) -> None:
             logger.error(f'Failed to remove etcd member: {e}')
 
 def fix_kubernetes_membership() -> None:
-    path = '/root/.kube/config'
-    if not os.path.exists(path):
-        logger.info("Kube config not found at /root/.kube/config, cluster must not be ready")
+    """Remove stale node entry so this node can rejoin cleanly.
+
+    The kubeconfig used depends on the security mode:
+      APPROACH_1/2: /root/.kube/config  (full admin)
+      APPROACH_3:   /share/phylactery-kubeconfig  (SA — node ops only)
+    """
+    kubeconfig = get_kubeconfig_path()
+    if kubeconfig is None:
+        logger.info("No kubeconfig available yet, skipping kubernetes membership check")
         return
-    
+
+    logger.info(f"Using kubeconfig: {kubeconfig} (mode: {SECURITY_MODE})")
     hostname = socket.gethostname()
     result_json = None
-    
-    # --- BUG FIX START ---
-    # We try to get nodes. If it fails (e.g. not joined yet), we catch the error 
-    # and RETURN immediately, so we don't crash on the next line.
+
     try:
-        result_raw = subprocess.run(['kubectl', 'get', 'nodes', '-o', 'json'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result_raw = subprocess.run(
+            ['kubectl', '--kubeconfig', kubeconfig, 'get', 'nodes', '-o', 'json'],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         result_json = json.loads(result_raw.stdout.decode())
     except subprocess.CalledProcessError as e:
-        logger.warning(f'Kubectl get nodes failed (Node likely not joined yet). This is normal during bootstrap: {e}')
+        logger.warning(f'Kubectl get nodes failed (node likely not joined yet). Normal during bootstrap: {e}')
         return
     except Exception as e:
         logger.error(f'Unexpected error checking kubernetes membership: {e}')
         return
-    # --- BUG FIX END ---
 
     if result_json is None or 'items' not in result_json:
         return
@@ -164,11 +207,18 @@ def fix_kubernetes_membership() -> None:
     if hostname in node_names:
         try:
             logger.info("Removing self before rejoining")
-            result_raw = subprocess.run(['kubectl', 'drain', hostname, '--delete-emptydir-data', '--force', '--ignore-daemonsets'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(
+                ['kubectl', '--kubeconfig', kubeconfig,
+                 'drain', hostname, '--delete-emptydir-data', '--force', '--ignore-daemonsets'],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
         except subprocess.CalledProcessError as e:
             logger.error(f'Failed to drain node: {e}')
         try:
-            result_raw = subprocess.run(['kubectl', 'delete', 'node', hostname], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(
+                ['kubectl', '--kubeconfig', kubeconfig, 'delete', 'node', hostname],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
         except subprocess.CalledProcessError as e:
             logger.error(f'Failed to delete node: {e}')
 
@@ -183,19 +233,19 @@ def main() -> None:
     record_node()
     # Discover other nodes
     nodes = discover_nodes()
-    # construct new config
+    # Construct new HAProxy config
     construct_config(nodes)
     # Import config
     import_config()
     # Restart HAProxy
     restart_haproxy()
-    # Send a GET request to each node
+    # Send a GET request to each node to trigger their HAProxy reload
     send_request_to_nodes(nodes)
-    # Checks if IP is still an etcd member and removes member status so it can rejoin
+    # Check if IP is still an etcd member and remove it so it can rejoin
     fix_etcd_membership(nodes)
-    # Check if node with the same hostname is part of the kubernetes cluster and remove it so it can rejoin
+    # Check if node with the same hostname is in the kubernetes cluster and remove it
     fix_kubernetes_membership()
-    # Create a final to signal that phylactery is ready and install script can proceed
+    # Signal that phylactery is ready so the install script can proceed
     set_ready_mark()
     # Start the HTTP server
     with socketserver.TCPServer(('', PORT), RequestHandler) as httpd:
