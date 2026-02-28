@@ -20,7 +20,7 @@
 #     against a Flask server on the cluster manager (10.0.0.3:8000).
 #     Sensitive credentials live in /var/lib/warewulf/private-secrets on the
 #     manager and are never written to /share.  After a node successfully joins
-#     it deletes its key (/etc/k8s-key.<HOSTNAME>), closing the auth window.
+#     it deletes its key (/etc/k8s-token.<HOSTNAME>), closing the auth window.
 #     /share/join-command.txt    Bootstrap token only (minimal scope)
 #     Secure server:             kube.config + pki.tar.gz (CA certs/keys only)
 #
@@ -50,9 +50,11 @@ echo "=== Security Mode: $SECURITY_MODE ==="
 mkdir -p /k8s-helper
 echo "$SECURITY_MODE" > /k8s-helper/security_mode
 
-# APPROACH_2: node key delivered by Warewulf overlay
+# APPROACH_2: node key delivered by Warewulf overlay.
+# generate-tokens.sh writes the key to k8s-token.<NODE> in the overlay,
+# so it lands on the node at /etc/k8s-token.<HOSTNAME>.
 SECURE_SERVER="http://10.0.0.3:8000"
-NODE_KEY_FILE="/etc/k8s-key.${HOSTNAME}"
+NODE_KEY_FILE="/etc/k8s-token.${HOSTNAME}"
 
 # ---------------------------------------------------------------------------
 # HELPER: ROBUST DNS FIX
@@ -240,21 +242,24 @@ if [ "$HOSTNAME" != "$LEADER" ]; then
     # ------------------------------------------------------------------
     APPROACH_1)
     # ------------------------------------------------------------------
-    # Full PKI and admin kubeconfig are on /share. Extract certs before
-    # joining so kubeadm finds them pre-populated (no --certificate-key).
+    # CA files are on /share. Extract them so kubeadm uses them to sign
+    # fresh node-specific certs for THIS node (no --certificate-key needed).
+    # pki.tar.gz contains CA certs/keys only — node-specific certs (e.g.
+    # apiserver.crt) are intentionally excluded so kubeadm generates them
+    # for the correct hostname/IP rather than reusing the leader's copies.
       until [ -f "/share/pki.tar.gz" ] && [ -f "$JOIN_COMMAND_FILE" ]; do
         echo "Waiting for PKI and join command on /share..."
         sleep 2
       done
 
-      mkdir -p /etc/kubernetes
-      tar -xzf /share/pki.tar.gz -C /etc/kubernetes
-      echo "PKI extracted from NFS."
-
       while [ $ATTEMPT -lt $MAX_JOIN_ATTEMPTS ]; do
         ATTEMPT=$((ATTEMPT + 1))
         echo "Control-plane join attempt $ATTEMPT/$MAX_JOIN_ATTEMPTS..."
         kubeadm reset -f || true
+        # Re-extract CA files after every reset — kubeadm reset wipes /etc/kubernetes/pki/
+        mkdir -p /etc/kubernetes
+        tar -xzf /share/pki.tar.gz -C /etc/kubernetes
+        echo "PKI (CA files) extracted from NFS."
         if eval "$(cat "$JOIN_COMMAND_FILE") --control-plane --v=5"; then
           echo "Successfully joined as control-plane follower."
           mkdir -p /root/.kube
@@ -285,26 +290,39 @@ if [ "$HOSTNAME" != "$LEADER" ]; then
 
       echo "Downloading credentials from secure server..."
       mkdir -p /root/.kube
+      DOWNLOAD_ATTEMPTS=0
       until curl -f -s "${SECURE_SERVER}/config/${NODE_KEY}" -o /root/.kube/config; do
-        echo "Waiting for kube.config on secure server..."
+        DOWNLOAD_ATTEMPTS=$((DOWNLOAD_ATTEMPTS + 1))
+        if [ $DOWNLOAD_ATTEMPTS -ge 30 ]; then
+          echo "ERROR: Timed out waiting for kube.config from secure server."
+          exit 1
+        fi
+        echo "Waiting for kube.config on secure server... (${DOWNLOAD_ATTEMPTS}/30)"
         sleep 5
       done
+      DOWNLOAD_ATTEMPTS=0
       until curl -f -s "${SECURE_SERVER}/certs/${NODE_KEY}" -o /tmp/pki.tar.gz; do
-        echo "Waiting for pki.tar.gz on secure server..."
+        DOWNLOAD_ATTEMPTS=$((DOWNLOAD_ATTEMPTS + 1))
+        if [ $DOWNLOAD_ATTEMPTS -ge 30 ]; then
+          echo "ERROR: Timed out waiting for pki.tar.gz from secure server."
+          exit 1
+        fi
+        echo "Waiting for pki.tar.gz on secure server... (${DOWNLOAD_ATTEMPTS}/30)"
         sleep 5
       done
-
-      mkdir -p /etc/kubernetes
-      tar -xzf /tmp/pki.tar.gz -C /etc/kubernetes
-      rm -f /tmp/pki.tar.gz
-      echo "PKI extracted from secure server."
+      echo "Credentials downloaded from secure server."
 
       while [ $ATTEMPT -lt $MAX_JOIN_ATTEMPTS ]; do
         ATTEMPT=$((ATTEMPT + 1))
         echo "Control-plane join attempt $ATTEMPT/$MAX_JOIN_ATTEMPTS..."
         kubeadm reset -f || true
+        # Re-extract CA files after every reset — kubeadm reset wipes /etc/kubernetes/pki/
+        mkdir -p /etc/kubernetes
+        tar -xzf /tmp/pki.tar.gz -C /etc/kubernetes
+        echo "PKI (CA files) extracted from secure server."
         if eval "$(cat "$JOIN_COMMAND_FILE") --control-plane --v=5"; then
           echo "Successfully joined as control-plane follower."
+          rm -f /tmp/pki.tar.gz
           # Self-destruct key — attack window closed
           rm -f "$NODE_KEY_FILE"
           echo "APPROACH_2: Node key deleted after successful join."
@@ -314,6 +332,7 @@ if [ "$HOSTNAME" != "$LEADER" ]; then
         echo "Attempt $ATTEMPT failed."
         [ $ATTEMPT -lt $MAX_JOIN_ATTEMPTS ] && sleep 15
       done
+      rm -f /tmp/pki.tar.gz
       ;;
 
     # ------------------------------------------------------------------
@@ -422,10 +441,18 @@ case "$SECURITY_MODE" in
     chmod 644 /share/kube.config
     echo "kube.config written."
 
-    # Complete PKI archive (includes ca.key, sa.key, etcd/ca.key, etc.)
-    tar -czf /share/pki.tar.gz -C /etc/kubernetes pki/
+    # CA-only PKI archive — contains the private CA keys that make APPROACH_1
+    # insecure (anyone with NFS access can forge certificates), but deliberately
+    # excludes node-specific certs (apiserver.crt, etcd/server.crt, etc.) so
+    # followers generate correct certs for their own hostname/IP rather than
+    # reusing the leader's certs and ending up with wrong SANs.
+    ( cd /etc/kubernetes && tar -czf /share/pki.tar.gz \
+        pki/ca.crt pki/ca.key \
+        pki/sa.key pki/sa.pub \
+        pki/front-proxy-ca.crt pki/front-proxy-ca.key \
+        pki/etcd/ca.crt pki/etcd/ca.key )
     chmod 644 /share/pki.tar.gz
-    echo "pki.tar.gz (full PKI) written."
+    echo "pki.tar.gz (CA files only) written."
 
     # Bootstrap join token for all nodes
     kubeadm token create --ttl 0 --print-join-command > "$JOIN_COMMAND_FILE"
