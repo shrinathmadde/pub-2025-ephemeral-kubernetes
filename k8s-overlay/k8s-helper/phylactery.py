@@ -1,3 +1,4 @@
+from typing import Optional
 ################################################################################
 # Author: Jonathan Decker
 # Email: jonathan.decker@uni-goettingen.de
@@ -50,7 +51,7 @@ SECURITY_MODE = _read_security_mode()
 logger.info(f"Security mode: {SECURITY_MODE}")
 
 
-def get_kubeconfig_path() -> str | None:
+def get_kubeconfig_path() -> Optional[str]:
     """Return the kubeconfig path appropriate for the active security mode."""
     if SECURITY_MODE == 'APPROACH_3':
         # Use the scoped SA kubeconfig written to /share by the leader.
