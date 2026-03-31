@@ -33,11 +33,51 @@ You can either edit the variable directly in the script, or pass it through the 
 
 ## Installation
 
-### OpenStack
-The code was tested in an OpenStack environment but should work with any Warewulf setup (tested with v4.5.8 on Rocky 9.4).
-If Warewulf is already installed, move on to [Ephemeral Kubernetes Configuration](#ephemeral-kubernetes-configuration).
+The repository ships two scripts that perform the complete cluster installation:
 
-To boot images via Warewulf in OpenStack, an image or volume is required that starts into a PXE boot sequence.
+| Script | What it does |
+|---|---|
+| `01-base-install.sh` | Runs **once** on the manager node. Installs and configures Warewulf, clones the repo, builds all Kubernetes and Slurm OS images, sets up the security server, and prepares all overlays. |
+| `02-provision-k8s.sh` | Provisions a **single** Kubernetes node. Generates a security token, registers the node in Warewulf, builds overlays, restarts DHCP/Warewulf, and reboots the node into the cluster. |
+
+### Quick Start (Automated)
+
+Tested with Warewulf v4.5.8 on Rocky Linux 9.4, in OpenStack or any bare-metal environment.
+
+#### 1. Prepare `node-config.conf`
+
+Copy the provided `node-config.conf` and fill in your environment values (manager IP, interface, DHCP range, node MAC/IP addresses, etc.) before running anything.
+
+#### 2. Run the base installation (once, on the manager node)
+
+```bash
+./01-base-install.sh
+```
+
+This single script handles everything: system preparation, SSH key generation, Warewulf install and configuration, Git clone, Kubernetes image build, Slurm image build, security server setup, and overlay preparation.
+
+#### 3. Provision Kubernetes nodes
+
+Run `02-provision-k8s.sh` once per node, passing the node name, MAC address, IP address, and optional role (`k8s-control` or `k8s-worker`, defaulting to `k8s-worker`):
+
+```bash
+# Provision the control plane node
+./02-provision-k8s.sh control0 <MAC> <IP> k8s-control
+
+# Provision worker nodes
+./02-provision-k8s.sh worker0 <MAC> <IP> k8s-worker
+./02-provision-k8s.sh worker1 <MAC> <IP> k8s-worker
+```
+
+Each invocation registers the node in Warewulf, generates its security token, rebuilds overlays, and reboots the node to PXE-boot into the cluster.
+
+> `02-provision-k8s.sh` is also called automatically by `04-balancer.sh` during dynamic node transitions.
+
+---
+
+### OpenStack Setup
+
+The code was tested in an OpenStack environment. To boot images via Warewulf in OpenStack, an image or volume is required that starts into a PXE boot sequence.
 
 Create a new network for the cluster (this might require additional quota)
 - Name the network "private-pxe"
@@ -67,94 +107,47 @@ Create the cluster node VMs
 - Set the pxe-boot image or volume for them
 - After creating all nodes go to Networks, private-pxe and Ports and disable Port Security for all control and worker nodes
 
-### Warewulf
-On the cluster-manager node proceed with the following steps:
+Once the VMs are ready, fill in `node-config.conf` with their MAC addresses and IPs, then run `01-base-install.sh` followed by `02-provision-k8s.sh` for each node as described above.
+
+---
+
+### Manual Installation Reference
+
+If you prefer to install manually (or already have Warewulf set up), the steps below mirror what the scripts automate.
+
+**Warewulf setup on the manager node:**
 
 - `dnf update -y`
 - `dnf install https://github.com/warewulf/warewulf/releases/download/v4.5.8/warewulf-4.5.8-1.el9.x86_64.rpm`
-- edit `/etc/warewulf/warewulf.conf` and set ipaddr to the internal IP of the cluster-manager VM, for example, 10.0.0.3, set network mask to 255.255.255.0 and set DHCP range to 10.0.0.1 to 10.0.0.254
+- Edit `/etc/warewulf/warewulf.conf`: set `ipaddr` to the internal IP of the cluster-manager (e.g. `10.0.0.3`), netmask to `255.255.255.0`, and DHCP range to `10.0.0.1`–`10.0.0.254`
 - `wwctl configure --all`
-- `sudo systemctl enable --now warewulfd`
-- Check with `sudo wwctl server status`
-- `wwctl container import docker://ghcr.io/hpcng/warewulf-rockylinux:9`
-- `wwctl container exec warewulf-rockylinux:9 /bin/sh`
-    - `dnf install -y nano`
-    - `exit`
+- `systemctl enable --now warewulfd`
+- Check with `wwctl server status`
 
-Add the nodes in Warewulf
-- `wwctl node add control0`
-- `wwctl node set --container warewulf-rockylinux:9 control0`
-- `wwctl node set --hwaddr <MAC ADDR> control0` The MAC Address can be found under Instances, control0, Interfaces
-- `wwctl node set --ipaddr <IP ADDR> control0` The IP Address can be found in the same interface as the MAC Address
-- `wwctl node set --netmask 255.255.255.0 control0`
-- `wwctl node set --netdev net0 control0`
-- `wwctl node set --nettagadd DNS1=1.1.1.1 control0` This sets the nameserver to be used
-
-Do so for all control and worker nodes.
-The pattern `control[0-99]` and `worker[0-99]` can be used to affect multiple nodes at once.
-- `wwctl configure -a`
-
-In OpenStack reboot the VMs and check console to ensure the nodes properly boot.
-- Test that the nodes are running: `ssh control0` or `ssh <IP ADDR>`
-
-### Ephemeral Kubernetes Configuration
-
-Setup an NFS share, which will be used to share tokens and coordinate leader election between the nodes.
-- Edit `/etc/warewulf/warewulf.conf` and under nfs add:
-```yaml
-  - path: /share
-    export options: rw,sync,no_root_squash
-    mount options: defaults
-    mount: true
-```
-- `wwctl configure -a`
-- `wwctl overlay build control0`
-
-Create the overlay to be used by the cluster:
+**Add nodes in Warewulf:**
 ```bash
-wwctl overlay create k8s-overlay
+wwctl node add control0 --netdev net0 --hwaddr <MAC> --ipaddr <IP>
+wwctl node set --container k8s-control-ww control0 --root tmpfs -O wwinit,k8s-overlay
 ```
 
-Clone this repository and cd into it:
-```bash
-cp -r k8s-overlay /var/lib/warewulf/overlays/k8s-overlay
-```
+Repeat for all control and worker nodes. The pattern `control[0-99]` / `worker[0-99]` can target multiple nodes at once.
 
-Download and stage the container images:
+**Download and build images:**
 ```bash
 cd k8s-images
 ./download-images.sh    # uses Kubernetes 1.32.1 by default
 ./copy-images.sh
-cd -
-```
-
-Add the VIP DNS entry to the hosts overlay:
-- Edit `/var/lib/warewulf/overlays/hosts/rootfs/etc/hosts.ww` and add:
-  ```
-  10.0.0.99 vip.kubernetes.local
-  ```
-  This sets the DNS entry for the virtual IP used by Keepalived for the HA setup.
-
-Build the node container images:
-```bash
-cd ww-image-builder
+cd ../ww-image-builder
 ./build-and-import.sh   # may take a few minutes
-cd -
 ```
 
 There are two container images: `k8s-base-ww` (for workers) and `k8s-control-ww` (for control nodes).
 
+**Configure the k8s overlay:**
 ```bash
-wwctl node set --container k8s-control-ww control[0-99]
-wwctl node set --container k8s-base-ww worker[0-99]
-
-# Assign the k8s overlay to all nodes
-wwctl node set -O wwinit,k8s-overlay control[0-99]
-wwctl node set -O wwinit,k8s-overlay worker[0-99]
-
-# Set rootfs to tmpfs so containerd's pivot_root works
-wwctl node set --root tmpfs control[0-99]
-wwctl node set --root tmpfs worker[0-99]
+cp -r k8s-overlay /var/lib/warewulf/overlays/k8s-overlay/rootfs/
+wwctl configure -a
+wwctl overlay build
 ```
 
 ---
